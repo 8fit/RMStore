@@ -134,16 +134,15 @@ typedef void (^RMStoreSuccessBlock)();
     NSMutableDictionary *_products;
     NSMutableSet *_productsRequestDelegates;
     NSMutableSet *_productsRequests;
-    
+
     NSMutableArray *_restoredTransactions;
-    
-    NSInteger _pendingRestoredTransactionsCount;
+    NSMutableSet *_pendingRestoredTransactionIds;
     BOOL _restoredCompletedTransactionsFinished;
-    
+
     SKReceiptRefreshRequest *_refreshReceiptRequest;
     void (^_refreshReceiptFailureBlock)(NSError* error);
     void (^_refreshReceiptSuccessBlock)();
-    
+
     void (^_restoreTransactionsFailureBlock)(NSError* error);
     void (^_restoreTransactionsSuccessBlock)(NSArray* transactions);
 }
@@ -157,6 +156,7 @@ typedef void (^RMStoreSuccessBlock)();
         _productsRequestDelegates = [NSMutableSet set];
         _productsRequests = [NSMutableSet set];
         _restoredTransactions = [NSMutableArray array];
+        _pendingRestoredTransactionIds = [NSMutableSet set];
         [[SKPaymentQueue defaultQueue] addTransactionObserver:self];
     }
     return self;
@@ -217,12 +217,12 @@ typedef void (^RMStoreSuccessBlock)();
     {
         payment.applicationUsername = userIdentifier;
     }
-    
+
     RMAddPaymentParameters *parameters = [[RMAddPaymentParameters alloc] init];
     parameters.successBlock = successBlock;
     parameters.failureBlock = failureBlock;
     _addPaymentParameters[productIdentifier] = parameters;
-    
+
     [[SKPaymentQueue defaultQueue] addPayment:payment];
 }
 
@@ -240,9 +240,9 @@ typedef void (^RMStoreSuccessBlock)();
     delegate.successBlock = successBlock;
     delegate.failureBlock = failureBlock;
     [_productsRequestDelegates addObject:delegate];
- 
+
     SKProductsRequest *productsRequest = [[SKProductsRequest alloc] initWithProductIdentifiers:identifiers];
-	productsRequest.delegate = delegate;
+    productsRequest.delegate = delegate;
     [_productsRequests addObject:productsRequest];
 
     [productsRequest start];
@@ -257,7 +257,7 @@ typedef void (^RMStoreSuccessBlock)();
                              failure:(void (^)(NSError *error))failureBlock
 {
     _restoredCompletedTransactionsFinished = NO;
-    _pendingRestoredTransactionsCount = 0;
+    [_pendingRestoredTransactionIds removeAllObjects];
     _restoredTransactions = [NSMutableArray array];
     _restoreTransactionsSuccessBlock = successBlock;
     _restoreTransactionsFailureBlock = failureBlock;
@@ -270,7 +270,7 @@ typedef void (^RMStoreSuccessBlock)();
 {
     NSAssert([[SKPaymentQueue defaultQueue] respondsToSelector:@selector(restoreCompletedTransactionsWithApplicationUsername:)], @"restoreCompletedTransactionsWithApplicationUsername: not supported in this iOS version. Use restoreTransactionsOnSuccess:failure: instead.");
     _restoredCompletedTransactionsFinished = NO;
-    _pendingRestoredTransactionsCount = 0;
+    [_pendingRestoredTransactionIds removeAllObjects];
     _restoreTransactionsSuccessBlock = successBlock;
     _restoreTransactionsFailureBlock = failureBlock;
     [[SKPaymentQueue defaultQueue] restoreCompletedTransactionsWithApplicationUsername:userIdentifier];
@@ -310,11 +310,11 @@ typedef void (^RMStoreSuccessBlock)();
 
 + (NSString*)localizedPriceOfProduct:(SKProduct*)product
 {
-	NSNumberFormatter *numberFormatter = [[NSNumberFormatter alloc] init];
-	numberFormatter.numberStyle = NSNumberFormatterCurrencyStyle;
-	numberFormatter.locale = product.priceLocale;
-	NSString *formattedString = [numberFormatter stringFromNumber:product.price];
-	return formattedString;
+    NSNumberFormatter *numberFormatter = [[NSNumberFormatter alloc] init];
+    numberFormatter.numberStyle = NSNumberFormatterCurrencyStyle;
+    numberFormatter.locale = product.priceLocale;
+    NSString *formattedString = [numberFormatter stringFromNumber:product.price];
+    return formattedString;
 }
 
 #pragma mark Observers
@@ -395,7 +395,7 @@ typedef void (^RMStoreSuccessBlock)();
 {
     RMStoreLog(@"restore transactions finished");
     _restoredCompletedTransactionsFinished = YES;
-    
+
     [self notifyRestoreTransactionFinishedIfApplicableAfterTransaction:nil];
 }
 
@@ -481,7 +481,7 @@ typedef void (^RMStoreSuccessBlock)();
 {
     SKPaymentTransaction *transaction = download.transaction;
     RMStoreLog(@"download %@ for product %@ finished", download.contentIdentifier, transaction.payment.productIdentifier);
-    
+
     [self postNotificationWithName:RMSKDownloadFinished download:download userInfoExtras:nil];
 
     const BOOL hasPendingDownloads = [self.class hasPendingDownloadsInTransaction:transaction];
@@ -528,7 +528,7 @@ typedef void (^RMStoreSuccessBlock)();
 - (void)didPurchaseTransaction:(SKPaymentTransaction *)transaction queue:(SKPaymentQueue*)queue
 {
     RMStoreLog(@"transaction purchased with product %@", transaction.payment.productIdentifier);
-    
+
     if (self.receiptVerifier != nil)
     {
         [self.receiptVerifier verifyTransaction:transaction success:^{
@@ -547,23 +547,23 @@ typedef void (^RMStoreSuccessBlock)();
 - (void)didFailTransaction:(SKPaymentTransaction *)transaction queue:(SKPaymentQueue*)queue error:(NSError*)error
 {
     SKPayment *payment = transaction.payment;
-	NSString* productIdentifier = payment.productIdentifier;
+    NSString* productIdentifier = payment.productIdentifier;
     RMStoreLog(@"transaction failed with product %@ and error %@", productIdentifier, error.debugDescription);
-    
+
     if (error.code != RMStoreErrorCodeUnableToCompleteVerification)
     { // If we were unable to complete the verification we want StoreKit to keep reminding us of the transaction
         [queue finishTransaction:transaction];
     }
-    
+
     RMAddPaymentParameters *parameters = [self popAddPaymentParametersForIdentifier:productIdentifier];
     if (parameters.failureBlock != nil)
     {
         parameters.failureBlock(transaction, error);
     }
-    
+
     NSDictionary *extras = error ? @{RMStoreNotificationStoreError : error} : nil;
     [self postNotificationWithName:RMSKPaymentTransactionFailed transaction:transaction userInfoExtras:extras];
-    
+
     if (transaction.transactionState == SKPaymentTransactionStateRestored)
     {
         [self notifyRestoreTransactionFinishedIfApplicableAfterTransaction:transaction];
@@ -572,9 +572,15 @@ typedef void (^RMStoreSuccessBlock)();
 
 - (void)didRestoreTransaction:(SKPaymentTransaction *)transaction queue:(SKPaymentQueue*)queue
 {
-    RMStoreLog(@"transaction restored with product %@", transaction.originalTransaction.payment.productIdentifier);
-    
-    _pendingRestoredTransactionsCount++;
+    NSString *productIdentifier = transaction.originalTransaction.payment.productIdentifier;
+    RMStoreLog(@"transaction restored with product %@", productIdentifier);
+
+
+    if (productIdentifier)
+    {
+        [_pendingRestoredTransactionIds addObject:productIdentifier];
+    }
+
     if (self.receiptVerifier != nil)
     {
         [self.receiptVerifier verifyTransaction:transaction success:^{
@@ -634,18 +640,18 @@ typedef void (^RMStoreSuccessBlock)();
 - (void)finishTransaction:(SKPaymentTransaction *)transaction queue:(SKPaymentQueue*)queue
 {
     SKPayment *payment = transaction.payment;
-	NSString* productIdentifier = payment.productIdentifier;
+    NSString* productIdentifier = payment.productIdentifier;
     [queue finishTransaction:transaction];
     [self.transactionPersistor persistTransaction:transaction];
-    
+
     RMAddPaymentParameters *wrapper = [self popAddPaymentParametersForIdentifier:productIdentifier];
     if (wrapper.successBlock != nil)
     {
         wrapper.successBlock(transaction);
     }
-    
+
     [self postNotificationWithName:RMSKPaymentTransactionFinished transaction:transaction userInfoExtras:nil];
-    
+
     if (transaction.transactionState == SKPaymentTransactionStateRestored)
     {
         [self notifyRestoreTransactionFinishedIfApplicableAfterTransaction:transaction];
@@ -657,9 +663,9 @@ typedef void (^RMStoreSuccessBlock)();
     if (transaction != nil)
     {
         [_restoredTransactions addObject:transaction];
-        _pendingRestoredTransactionsCount--;
+        [_pendingRestoredTransactionIds removeObject:transaction.payment.productIdentifier];
     }
-    if (_restoredCompletedTransactionsFinished && _pendingRestoredTransactionsCount == 0)
+    if (_restoredCompletedTransactionsFinished && _pendingRestoredTransactionIds.count == 0)
     { // Wait until all restored transations have been verified
         NSArray *restoredTransactions = [_restoredTransactions copy];
         if (_restoreTransactionsSuccessBlock != nil)
@@ -714,7 +720,7 @@ typedef void (^RMStoreSuccessBlock)();
 
 - (void)addProduct:(SKProduct*)product
 {
-    _products[product.productIdentifier] = product;    
+    _products[product.productIdentifier] = product;
 }
 
 - (void)postNotificationWithName:(NSString*)notificationName download:(SKDownload*)download userInfoExtras:(NSDictionary*)extras
@@ -756,17 +762,17 @@ typedef void (^RMStoreSuccessBlock)();
     RMStoreLog(@"products request received response");
     NSArray *products = [NSArray arrayWithArray:response.products];
     NSArray *invalidProductIdentifiers = [NSArray arrayWithArray:response.invalidProductIdentifiers];
-    
+
     for (SKProduct *product in products)
     {
         RMStoreLog(@"received product with id %@", product.productIdentifier);
         [self.store addProduct:product];
     }
-    
+
     [invalidProductIdentifiers enumerateObjectsUsingBlock:^(NSString *invalid, NSUInteger idx, BOOL *stop) {
         RMStoreLog(@"invalid product with id %@", invalid);
     }];
-    
+
     if (self.successBlock)
     {
         self.successBlock(products, invalidProductIdentifiers);
